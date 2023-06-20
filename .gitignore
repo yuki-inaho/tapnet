@@ -25,3 +25,5 @@ MANIFEST
 
 # custom
 checkpoints
+pyproject.toml
+*.mp4

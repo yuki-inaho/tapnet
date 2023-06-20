@@ -15,6 +15,8 @@
 
 """Live Demo for Online TAPIR."""
 
+import sys
+import argparse
 import functools
 import time
 
@@ -23,10 +25,26 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
+from typing import Union, Optional
+
+from pathlib import Path
+
+# @HACK: This is a hack to import tapnet module.
+#  File "/home/inaho-omen/Project/tapnet/live_demo.py", line 28, in <module>
+#    from tapnet import tapir_model
+# ModuleNotFoundError: No module named 'tapnet'
+current_dir_path = str(Path(__file__).parent)
+parent_dir_path_of_current_dir = str(Path(current_dir_path).parent.absolute())
+print(f"The python search path is added: {parent_dir_path_of_current_dir}")
+sys.path.append(parent_dir_path_of_current_dir)
+
 from tapnet import tapir_model
 
 
 NUM_POINTS = 8
+RESIZED_HEIGHT = 256
+MAX_TRY_COUNT_TO_CAPTURE_FRAMES = 5
+DUMP_FPS = 30
 
 
 def construct_initial_causal_state(num_points, num_resolutions):
@@ -151,146 +169,179 @@ def get_frame(video_capture):
     return r_val, image
 
 
-print("Welcome to the TAPIR live demo.")
-print("Please note that if the framerate is low (<~12 fps), TAPIR performance")
-print("may degrade and you may need a more powerful GPU.")
+def main(capture_input: Union[str, int], dump_video_flag: bool):
+    print("Welcome to the TAPIR live demo.")
+    print("Please note that if the framerate is low (<~12 fps), TAPIR performance")
+    print("may degrade and you may need a more powerful GPU.")
 
-print("Loading checkpoint...")
-# --------------------
-# Load checkpoint and initialize
-params, state = load_checkpoint("tapnet/checkpoints/causal_tapir_checkpoint.npy")
+    print("Loading checkpoint...")
+    # --------------------
+    # Load checkpoint and initialize
+    params, state = load_checkpoint(str(Path(current_dir_path, "checkpoints/causal_tapir_checkpoint.npy")))
 
-print("Creating model...")
-online_init = hk.transform_with_state(build_online_model_init)
-online_init_apply = jax.jit(online_init.apply)
+    print("Creating model...")
+    online_init = hk.transform_with_state(build_online_model_init)
+    online_init_apply = jax.jit(online_init.apply)
 
-online_predict = hk.transform_with_state(build_online_model_predict)
-online_predict_apply = jax.jit(online_predict.apply)
+    online_predict = hk.transform_with_state(build_online_model_predict)
+    online_predict_apply = jax.jit(online_predict.apply)
 
-rng = jax.random.PRNGKey(42)
-online_init_apply = functools.partial(online_init_apply, params=params, state=state, rng=rng)
-online_predict_apply = functools.partial(online_predict_apply, params=params, state=state, rng=rng)
+    rng = jax.random.PRNGKey(42)
+    online_init_apply = functools.partial(online_init_apply, params=params, state=state, rng=rng)
+    online_predict_apply = functools.partial(online_predict_apply, params=params, state=state, rng=rng)
 
-print("Initializing camera...")
-# --------------------
-# Start point tracking
-vc = cv2.VideoCapture(0)
-
-vc.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-if vc.isOpened():  # try to get the first frame
-    rval, frame = get_frame(vc)
-else:
-    raise ValueError("Unable to open camera.")
-
-pos = tuple()
-query_frame = True
-have_point = [False] * NUM_POINTS
-query_features = None
-causal_state = None
-next_query_idx = 0
-
-print("Compiling jax functions (this may take a while...)")
-# --------------------
-# Call one time to compile
-query_points = jnp.zeros([NUM_POINTS, 3], dtype=jnp.float32)
-query_features, _ = online_init_apply(
-    frames=preprocess_frames(frame[None, None]),
-    points=query_points[None, 0:1],
-)
-jax.block_until_ready(query_features)
-
-query_features, _ = online_init_apply(
-    frames=preprocess_frames(frame[None, None]),
-    points=query_points[None],
-)
-causal_state = construct_initial_causal_state(NUM_POINTS, len(query_features.resolutions) - 1)
-(prediction, causal_state), _ = online_predict_apply(
-    frames=preprocess_frames(frame[None, None]),
-    features=query_features,
-    causal_context=causal_state,
-)
-
-jax.block_until_ready(prediction["tracks"])
-
-last_click_time = 0
-
-
-def mouse_click(event, x, y, flags, param):
-    del flags, param
-    global pos, query_frame, last_click_time
-
-    # event fires multiple times per click sometimes??
-    if (time.time() - last_click_time) < 0.5:
-        return
-
-    if event == cv2.EVENT_LBUTTONDOWN:
-        pos = (y, frame.shape[1] - x)
-        query_frame = True
-        last_click_time = time.time()
-
-
-cv2.namedWindow("Point Tracking")
-cv2.setMouseCallback("Point Tracking", mouse_click)
-
-t = time.time()
-step_counter = 0
-
-while rval:
-    rval, frame = get_frame(vc)
-    if query_frame:
-        query_points = jnp.array((0,) + pos, dtype=jnp.float32)
-
-        init_query_features, _ = online_init_apply(
-            frames=preprocess_frames(frame[None, None]),
-            points=query_points[None, None],
-        )
-        init_causal_state = construct_initial_causal_state(1, len(query_features.resolutions) - 1)
-
-        # cv2.circle(frame, (pos[0], pos[1]), 5, (255,0,0), -1)
-        query_frame = False
-
-        def upd(s1, s2):
-            return s1.at[:, next_query_idx : next_query_idx + 1].set(s2)
-
-        causal_state = jax.tree_map(upd, causal_state, init_causal_state)
-        query_features = tapir_model.QueryFeatures(
-            lowres=jax.tree_map(upd, query_features.lowres, init_query_features.lowres),
-            hires=jax.tree_map(upd, query_features.hires, init_query_features.hires),
-            resolutions=query_features.resolutions,
-        )
-        have_point[next_query_idx] = True
-        next_query_idx = (next_query_idx + 1) % NUM_POINTS
-    if pos:
-        (prediction, causal_state), _ = online_predict_apply(
-            frames=preprocess_frames(frame[None, None]),
-            features=query_features,
-            causal_context=causal_state,
-        )
-        track = prediction["tracks"][0, :, 0]
-        occlusion = prediction["occlusion"][0, :, 0]
-        expected_dist = prediction["expected_dist"][0, :, 0]
-        visibles = postprocess_occlusions(occlusion, expected_dist)
-        track = np.round(track)
-
-        for i in range(len(have_point)):
-            if visibles[i] and have_point[i]:
-                cv2.circle(frame, (int(track[i, 0]), int(track[i, 1])), 5, (255, 0, 0), -1)
-                if track[i, 0] < 16 and track[i, 1] < 16:
-                    print((i, next_query_idx))
-    cv2.imshow("Point Tracking", frame[:, ::-1])
-    if pos:
-        step_counter += 1
-        if time.time() - t > 5:
-            print(f"{step_counter/(time.time()-t)} frames per second")
-            t = time.time()
-            step_counter = 0
+    print("Initializing the VideoCapture module...")
+    vc = cv2.VideoCapture(capture_input)
+    try_count_capturing = 0
+    if vc.isOpened():  # try to get the first frame
+        while True:
+            rval, frame = get_frame(vc)
+            if not rval:
+                try_count_capturing += 1
+                if try_count_capturing >= MAX_TRY_COUNT_TO_CAPTURE_FRAMES:
+                    print("Unable to capture frames from the camera: try_count_capturing >= MAX_TRY_COUNT_TO_CAPTURE_FRAMES")
+                    sys.exit(1)
+            else:
+                break
     else:
-        t = time.time()
-    key = cv2.waitKey(1)
+        raise ValueError("Unable to open camera.")
 
-    if key == 27:  # exit on ESC
-        break
+    image_height, image_width, _ = frame.shape
+    resized_rate = RESIZED_HEIGHT / image_height
+    resize_image = functools.partial(cv2.resize, dsize=None, fx=resized_rate, fy=resized_rate)
+    image_height_resized, image_width_resized, _ = resize_image(frame).shape
+    print(f"The size of truncated input images: {image_width}x{image_height}")
+    print(f"The size of target images: {image_width_resized}x{image_height_resized}")
 
-cv2.destroyWindow("Point Tracking")
-vc.release()
+    # --------------------
+    # Start point tracking
+    pos = tuple()
+    query_frame = True
+    have_point = [False] * NUM_POINTS
+    query_features = None
+    causal_state = None
+    next_query_idx = 0
+
+    print("Compiling jax functions (this may take a while...)")
+    # --------------------
+    # Call one time to compile
+    query_points = jnp.zeros([NUM_POINTS, 3], dtype=jnp.float32)
+    query_features, _ = online_init_apply(
+        frames=preprocess_frames(frame[None, None]),
+        points=query_points[None, 0:1],
+    )
+    jax.block_until_ready(query_features)
+
+    query_features, _ = online_init_apply(
+        frames=preprocess_frames(frame[None, None]),
+        points=query_points[None],
+    )
+    causal_state = construct_initial_causal_state(NUM_POINTS, len(query_features.resolutions) - 1)
+    (prediction, causal_state), _ = online_predict_apply(
+        frames=preprocess_frames(frame[None, None]),
+        features=query_features,
+        causal_context=causal_state,
+    )
+
+    jax.block_until_ready(prediction["tracks"])
+
+    last_click_time = 0
+
+    def mouse_click(event, x, y, flags, param):
+        del flags, param
+        global pos, query_frame, last_click_time
+
+        # event fires multiple times per click sometimes??
+        if (time.time() - last_click_time) < 0.5:
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            pos = (y, frame.shape[1] - x)
+            query_frame = True
+            last_click_time = time.time()
+
+    # Set up the video writer
+    writer: Optional[cv2.VideoWriter] = None
+    if dump_video_flag:
+        fourcc = cv2.VideoWriter_fourcc("m", "p", "4", "v")
+        writer = cv2.VideoWriter(str(Path(current_dir_path, "output", "output.mp4")), fourcc, DUMP_FPS, (image_width_resized, image_height_resized))
+
+    cv2.namedWindow("Point Tracking")
+    cv2.setMouseCallback("Point Tracking", mouse_click)
+
+    t = time.time()
+    step_counter = 0
+
+    while rval:
+        rval, frame = get_frame(vc)
+        frame = resize_image(frame)
+        if query_frame:
+            query_points = jnp.array((0,) + pos, dtype=jnp.float32)
+
+            init_query_features, _ = online_init_apply(
+                frames=preprocess_frames(frame[None, None]),
+                points=query_points[None, None],
+            )
+            init_causal_state = construct_initial_causal_state(1, len(query_features.resolutions) - 1)
+
+            # cv2.circle(frame, (pos[0], pos[1]), 5, (255,0,0), -1)
+            query_frame = False
+
+            def upd(s1, s2):
+                return s1.at[:, next_query_idx : next_query_idx + 1].set(s2)
+
+            causal_state = jax.tree_map(upd, causal_state, init_causal_state)
+            query_features = tapir_model.QueryFeatures(
+                lowres=jax.tree_map(upd, query_features.lowres, init_query_features.lowres),
+                hires=jax.tree_map(upd, query_features.hires, init_query_features.hires),
+                resolutions=query_features.resolutions,
+            )
+            have_point[next_query_idx] = True
+            next_query_idx = (next_query_idx + 1) % NUM_POINTS
+        if pos:
+            (prediction, causal_state), _ = online_predict_apply(
+                frames=preprocess_frames(frame[None, None]),
+                features=query_features,
+                causal_context=causal_state,
+            )
+            track = prediction["tracks"][0, :, 0]
+            occlusion = prediction["occlusion"][0, :, 0]
+            expected_dist = prediction["expected_dist"][0, :, 0]
+            visibles = postprocess_occlusions(occlusion, expected_dist)
+            track = np.round(track)
+
+            for i in range(len(have_point)):
+                if visibles[i] and have_point[i]:
+                    cv2.circle(frame, (int(track[i, 0]), int(track[i, 1])), 5, (255, 0, 0), -1)
+                    if track[i, 0] < 16 and track[i, 1] < 16:
+                        print((i, next_query_idx))
+        cv2.imshow("Point Tracking", frame[:, ::-1])
+        if pos:
+            step_counter += 1
+            if time.time() - t > 5:
+                print(f"{step_counter/(time.time()-t)} frames per second")
+                t = time.time()
+                step_counter = 0
+        else:
+            t = time.time()
+        if dump_video_flag:
+            writer.write(frame[:, ::-1])
+        key = cv2.waitKey(1)
+
+        if key == 27:  # exit on ESC
+            break
+    if dump_video_flag:
+        writer.release()
+
+    cv2.destroyWindow("Point Tracking")
+    vc.release()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process a video or camera feed.")
+    parser.add_argument("-i", "--input", type=str, default="0", help="path to the video file or integer for the camera id")
+    parser.add_argument("-hs", "--height-of-input-images", type=int, default=240, help="height of input images")
+    parser.add_argument("--dump-video", action="store_true", help="Dump processed video to file (default: False)")
+    args = parser.parse_args()
+    capture_input = args.input if not args.input.isdigit() else int(args.input)
+    main(capture_input, args.dump_video)
